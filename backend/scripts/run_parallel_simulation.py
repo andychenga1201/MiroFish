@@ -102,6 +102,14 @@ else:
         load_dotenv(_backend_env)
         print(f"已加载环境配置: {_backend_env}")
 
+from sim_runtime import (
+    append_initial_post_action,
+    candidate_agent_ids,
+    count_initial_actions,
+    prepare_round_schedule,
+    round_clock,
+)
+
 
 class MaxTokensWarningFilter(logging.Filter):
     """过滤掉 camel-ai 关于 max_tokens 的警告（我们故意不设置 max_tokens，让模型自行决定）"""
@@ -172,6 +180,10 @@ except ImportError as e:
     print(f"错误: 缺少依赖 {e}")
     print("请先安装: pip install oasis-ai camel-ai")
     sys.exit(1)
+
+from oasis_compat import install_empty_post_table_guard
+
+install_empty_post_table_guard()
 
 
 # Twitter可用动作（不包含INTERVIEW，INTERVIEW只能通过ManualAction手动触发）
@@ -1063,14 +1075,7 @@ def get_active_agents_for_round(
     target_count = int(random.uniform(base_min, base_max) * multiplier)
     
     candidates = []
-    for cfg in agent_configs:
-        agent_id = cfg.get("agent_id", 0)
-        active_hours = cfg.get("active_hours", list(range(8, 23)))
-        activity_level = cfg.get("activity_level", 0.5)
-        
-        if current_hour not in active_hours:
-            continue
-        
+    for agent_id, activity_level in candidate_agent_ids(agent_configs, current_hour):
         if random.random() < activity_level:
             candidates.append(agent_id)
     
@@ -1184,9 +1189,13 @@ async def run_twitter_simulation(
             content = post.get("content", "")
             try:
                 agent = result.env.agent_graph.get_agent(agent_id)
-                initial_actions[agent] = ManualAction(
-                    action_type=ActionType.CREATE_POST,
-                    action_args={"content": content}
+                append_initial_post_action(
+                    initial_actions,
+                    agent,
+                    ManualAction(
+                        action_type=ActionType.CREATE_POST,
+                        action_args={"content": content}
+                    ),
                 )
                 
                 if action_logger:
@@ -1204,7 +1213,7 @@ async def run_twitter_simulation(
         
         if initial_actions:
             await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+            log_info(f"已发布 {count_initial_actions(initial_actions)} 条初始帖子")
     
     # 记录 round 0 结束
     if action_logger:
@@ -1214,14 +1223,28 @@ async def run_twitter_simulation(
     time_config = config.get("time_config", {})
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
+    schedule = prepare_round_schedule(
+        total_hours=total_hours,
+        minutes_per_round=minutes_per_round,
+        max_rounds=max_rounds,
+        agent_configs=config.get("agent_configs", []),
+    )
+    total_rounds = schedule["total_rounds"]
+    minutes_per_round = schedule["minutes_per_round"]
+    hour_offset = schedule["hour_offset"]
     
     # 如果指定了最大轮数，则截断
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+    if schedule["truncated"]:
+        log_info(
+            f"轮数已截断: {schedule['original_rounds']} -> {total_rounds} "
+            f"(max_rounds={max_rounds})"
+        )
+    if hour_offset:
+        start_hour = round_clock(0, minutes_per_round, hour_offset)[1]
+        log_info(
+            f"短程起始小时: {start_hour:02d}:00"
+            "（截断窗口原本不覆盖任何Agent活跃时段；完整日程仍从 00:00 开始）"
+        )
     
     start_time = datetime.now()
     
@@ -1232,9 +1255,9 @@ async def run_twitter_simulation(
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
         
-        simulated_minutes = round_num * minutes_per_round
-        simulated_hour = (simulated_minutes // 60) % 24
-        simulated_day = simulated_minutes // (60 * 24) + 1
+        simulated_minutes, simulated_hour, simulated_day = round_clock(
+            round_num, minutes_per_round, hour_offset
+        )
         
         active_agents = get_active_agents_for_round(
             result.env, config, simulated_hour, round_num
@@ -1375,18 +1398,14 @@ async def run_reddit_simulation(
             content = post.get("content", "")
             try:
                 agent = result.env.agent_graph.get_agent(agent_id)
-                if agent in initial_actions:
-                    if not isinstance(initial_actions[agent], list):
-                        initial_actions[agent] = [initial_actions[agent]]
-                    initial_actions[agent].append(ManualAction(
+                append_initial_post_action(
+                    initial_actions,
+                    agent,
+                    ManualAction(
                         action_type=ActionType.CREATE_POST,
                         action_args={"content": content}
-                    ))
-                else:
-                    initial_actions[agent] = ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
-                    )
+                    ),
+                )
                 
                 if action_logger:
                     action_logger.log_action(
@@ -1403,7 +1422,7 @@ async def run_reddit_simulation(
         
         if initial_actions:
             await result.env.step(initial_actions)
-            log_info(f"已发布 {len(initial_actions)} 条初始帖子")
+            log_info(f"已发布 {count_initial_actions(initial_actions)} 条初始帖子")
     
     # 记录 round 0 结束
     if action_logger:
@@ -1413,14 +1432,28 @@ async def run_reddit_simulation(
     time_config = config.get("time_config", {})
     total_hours = time_config.get("total_simulation_hours", 72)
     minutes_per_round = time_config.get("minutes_per_round", 30)
-    total_rounds = (total_hours * 60) // minutes_per_round
+    schedule = prepare_round_schedule(
+        total_hours=total_hours,
+        minutes_per_round=minutes_per_round,
+        max_rounds=max_rounds,
+        agent_configs=config.get("agent_configs", []),
+    )
+    total_rounds = schedule["total_rounds"]
+    minutes_per_round = schedule["minutes_per_round"]
+    hour_offset = schedule["hour_offset"]
     
     # 如果指定了最大轮数，则截断
-    if max_rounds is not None and max_rounds > 0:
-        original_rounds = total_rounds
-        total_rounds = min(total_rounds, max_rounds)
-        if total_rounds < original_rounds:
-            log_info(f"轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+    if schedule["truncated"]:
+        log_info(
+            f"轮数已截断: {schedule['original_rounds']} -> {total_rounds} "
+            f"(max_rounds={max_rounds})"
+        )
+    if hour_offset:
+        start_hour = round_clock(0, minutes_per_round, hour_offset)[1]
+        log_info(
+            f"短程起始小时: {start_hour:02d}:00"
+            "（截断窗口原本不覆盖任何Agent活跃时段；完整日程仍从 00:00 开始）"
+        )
     
     start_time = datetime.now()
     
@@ -1431,9 +1464,9 @@ async def run_reddit_simulation(
                 main_logger.info(f"收到退出信号，在第 {round_num + 1} 轮停止模拟")
             break
         
-        simulated_minutes = round_num * minutes_per_round
-        simulated_hour = (simulated_minutes // 60) % 24
-        simulated_day = simulated_minutes // (60 * 24) + 1
+        simulated_minutes, simulated_hour, simulated_day = round_clock(
+            round_num, minutes_per_round, hour_offset
+        )
         
         active_agents = get_active_agents_for_round(
             result.env, config, simulated_hour, round_num
