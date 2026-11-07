@@ -46,6 +46,13 @@ else:
     if os.path.exists(_backend_env):
         load_dotenv(_backend_env)
 
+from sim_runtime import (
+    append_initial_post_action,
+    candidate_agent_ids,
+    count_initial_actions,
+    prepare_round_schedule,
+    round_clock,
+)
 
 import re
 
@@ -129,6 +136,12 @@ except ImportError as e:
     print(f"错误: 缺少依赖 {e}")
     print("请先安装: pip install oasis-ai camel-ai")
     sys.exit(1)
+
+from oasis_compat import install_empty_post_table_guard
+from twhin_bert_compat import install_twhin_relative_key_support
+
+install_empty_post_table_guard()
+install_twhin_relative_key_support()
 
 
 # IPC相关常量
@@ -496,17 +509,9 @@ class TwitterSimulationRunner:
         
         target_count = int(random.uniform(base_min, base_max) * multiplier)
         
-        # 根据每个Agent的配置计算激活概率
+        # 活跃时段过滤与完整日程相同；短窗口的小时由 round_clock 对齐。
         candidates = []
-        for cfg in agent_configs:
-            agent_id = cfg.get("agent_id", 0)
-            active_hours = cfg.get("active_hours", list(range(8, 23)))
-            activity_level = cfg.get("activity_level", 0.5)
-            
-            # 检查是否在活跃时间
-            if current_hour not in active_hours:
-                continue
-            
+        for agent_id, activity_level in candidate_agent_ids(agent_configs, current_hour):
             # 根据活跃度计算概率
             if random.random() < activity_level:
                 candidates.append(agent_id)
@@ -545,16 +550,22 @@ class TwitterSimulationRunner:
         time_config = self.config.get("time_config", {})
         total_hours = time_config.get("total_simulation_hours", 72)
         minutes_per_round = time_config.get("minutes_per_round", 30)
-        
-        # 计算总轮数
-        total_rounds = (total_hours * 60) // minutes_per_round
+        schedule = prepare_round_schedule(
+            total_hours=total_hours,
+            minutes_per_round=minutes_per_round,
+            max_rounds=max_rounds,
+            agent_configs=self.config.get("agent_configs", []),
+        )
+        total_rounds = schedule["total_rounds"]
+        minutes_per_round = schedule["minutes_per_round"]
+        hour_offset = schedule["hour_offset"]
         
         # 如果指定了最大轮数，则截断
-        if max_rounds is not None and max_rounds > 0:
-            original_rounds = total_rounds
-            total_rounds = min(total_rounds, max_rounds)
-            if total_rounds < original_rounds:
-                print(f"\n轮数已截断: {original_rounds} -> {total_rounds} (max_rounds={max_rounds})")
+        if schedule["truncated"]:
+            print(
+                f"\n轮数已截断: {schedule['original_rounds']} -> {total_rounds} "
+                f"(max_rounds={max_rounds})"
+            )
         
         print(f"\n模拟参数:")
         print(f"  - 总模拟时长: {total_hours}小时")
@@ -563,6 +574,12 @@ class TwitterSimulationRunner:
         if max_rounds:
             print(f"  - 最大轮数限制: {max_rounds}")
         print(f"  - Agent数量: {len(self.config.get('agent_configs', []))}")
+        if hour_offset:
+            start_hour = round_clock(0, minutes_per_round, hour_offset)[1]
+            print(
+                f"  - 短程起始小时: {start_hour:02d}:00"
+                "（截断窗口原本不覆盖任何Agent活跃时段；完整日程仍从 00:00 开始）"
+            )
         
         # 创建模型
         print("\n初始化LLM模型...")
@@ -615,26 +632,30 @@ class TwitterSimulationRunner:
                 content = post.get("content", "")
                 try:
                     agent = self.env.agent_graph.get_agent(agent_id)
-                    initial_actions[agent] = ManualAction(
-                        action_type=ActionType.CREATE_POST,
-                        action_args={"content": content}
+                    append_initial_post_action(
+                        initial_actions,
+                        agent,
+                        ManualAction(
+                            action_type=ActionType.CREATE_POST,
+                            action_args={"content": content}
+                        ),
                     )
                 except Exception as e:
                     print(f"  警告: 无法为Agent {agent_id}创建初始帖子: {e}")
             
             if initial_actions:
                 await self.env.step(initial_actions)
-                print(f"  已发布 {len(initial_actions)} 条初始帖子")
+                print(f"  已发布 {count_initial_actions(initial_actions)} 条初始帖子")
         
         # 主模拟循环
         print("\n开始模拟循环...")
         start_time = datetime.now()
         
         for round_num in range(total_rounds):
-            # 计算当前模拟时间
-            simulated_minutes = round_num * minutes_per_round
-            simulated_hour = (simulated_minutes // 60) % 24
-            simulated_day = simulated_minutes // (60 * 24) + 1
+            # 计算当前模拟时间。hour_offset 只在截断窗口没有任何活跃时段时非 0。
+            simulated_minutes, simulated_hour, simulated_day = round_clock(
+                round_num, minutes_per_round, hour_offset
+            )
             
             # 获取本轮激活的Agent
             active_agents = self._get_active_agents_for_round(
