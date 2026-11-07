@@ -182,8 +182,10 @@ except ImportError as e:
     sys.exit(1)
 
 from oasis_compat import install_empty_post_table_guard
+from twhin_bert_compat import install_twhin_relative_key_support
 
 install_empty_post_table_guard()
+install_twhin_relative_key_support()
 
 
 # Twitter可用动作（不包含INTERVIEW，INTERVIEW只能通过ManualAction手动触发）

@@ -27,84 +27,88 @@ from oasis_compat import install_empty_post_table_guard  # noqa: E402
 _INSERTED_MODULES: list[str] = []
 
 
-def _ensure_module(name: str) -> types.ModuleType:
+def _ensure_module(name: str):
+    """Return ``(module, created)``. Never replace a module that already imports."""
     existing = sys.modules.get(name)
     if existing is not None:
-        return existing
+        return existing, False
     try:
-        imported = importlib.import_module(name)
+        return importlib.import_module(name), False
     except Exception:
-        imported = None
-    if imported is not None:
-        return imported
-    module = types.ModuleType(name)
-    sys.modules[name] = module
-    _INSERTED_MODULES.append(name)
-    return module
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        _INSERTED_MODULES.append(name)
+        return module, True
 
 
 def _install_heavy_stubs() -> None:
-    sklearn = _ensure_module("sklearn")
-    feature_extraction = _ensure_module("sklearn.feature_extraction")
-    text = _ensure_module("sklearn.feature_extraction.text")
+    sklearn, sklearn_created = _ensure_module("sklearn")
+    feature_extraction, feature_created = _ensure_module("sklearn.feature_extraction")
+    text, text_created = _ensure_module("sklearn.feature_extraction.text")
+    if text_created:
+        class TfidfVectorizer:
+            def __init__(self, *args, **kwargs):
+                pass
 
-    class TfidfVectorizer:
-        def __init__(self, *args, **kwargs):
+        text.TfidfVectorizer = TfidfVectorizer
+    if feature_created:
+        feature_extraction.text = text
+    if sklearn_created:
+        sklearn.feature_extraction = feature_extraction
+
+    metrics, metrics_created = _ensure_module("sklearn.metrics")
+    pairwise, pairwise_created = _ensure_module("sklearn.metrics.pairwise")
+    if pairwise_created:
+        pairwise.cosine_similarity = lambda *args, **kwargs: None
+    if metrics_created:
+        metrics.pairwise = pairwise
+        sklearn.metrics = metrics
+
+    torch, torch_created = _ensure_module("torch")
+    if torch_created:
+        torch.device = lambda name="cpu": name
+        torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+        torch.no_grad = lambda: (lambda fn: fn)
+        torch.cat = lambda *args, **kwargs: None
+        torch.tensor = lambda *args, **kwargs: None
+
+    sentence_transformers, sentence_created = _ensure_module("sentence_transformers")
+    if sentence_created:
+        class SentenceTransformer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        sentence_transformers.SentenceTransformer = SentenceTransformer
+
+    camel, camel_created = _ensure_module("camel")
+    if camel_created:
+        camel.__path__ = getattr(camel, "__path__", [])
+    embeddings, embeddings_created = _ensure_module("camel.embeddings")
+    if embeddings_created:
+        class OpenAIEmbedding:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("OpenAI embeddings are not available in offline tests")
+
+        embeddings.OpenAIEmbedding = OpenAIEmbedding
+        camel.embeddings = embeddings
+    camel_types, types_created = _ensure_module("camel.types")
+    if types_created:
+        class EmbeddingModelType:
+            TEXT_EMBEDDING_3_SMALL = "text-embedding-3-small"
+
+        camel_types.EmbeddingModelType = EmbeddingModelType
+        camel.types = camel_types
+
+    transformers, transformers_created = _ensure_module("transformers")
+    if transformers_created:
+        class AutoModel:
             pass
 
-    text.TfidfVectorizer = TfidfVectorizer
-    feature_extraction.text = text
-    sklearn.feature_extraction = feature_extraction
-
-    metrics = _ensure_module("sklearn.metrics")
-    pairwise = _ensure_module("sklearn.metrics.pairwise")
-    pairwise.cosine_similarity = lambda *args, **kwargs: None
-    metrics.pairwise = pairwise
-    sklearn.metrics = metrics
-
-    torch = _ensure_module("torch")
-    torch.device = lambda name="cpu": name
-    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
-    torch.no_grad = lambda: (lambda fn: fn)
-    torch.cat = lambda *args, **kwargs: None
-    torch.tensor = lambda *args, **kwargs: None
-
-    sentence_transformers = _ensure_module("sentence_transformers")
-
-    class SentenceTransformer:
-        def __init__(self, *args, **kwargs):
+        class AutoTokenizer:
             pass
 
-    sentence_transformers.SentenceTransformer = SentenceTransformer
-
-    camel = _ensure_module("camel")
-    camel.__path__ = getattr(camel, "__path__", [])
-    embeddings = _ensure_module("camel.embeddings")
-
-    class OpenAIEmbedding:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("OpenAI embeddings are not available in offline tests")
-
-    embeddings.OpenAIEmbedding = OpenAIEmbedding
-    camel.embeddings = embeddings
-    camel_types = _ensure_module("camel.types")
-
-    class EmbeddingModelType:
-        TEXT_EMBEDDING_3_SMALL = "text-embedding-3-small"
-
-    camel_types.EmbeddingModelType = EmbeddingModelType
-    camel.types = camel_types
-
-    transformers = _ensure_module("transformers")
-
-    class AutoModel:
-        pass
-
-    class AutoTokenizer:
-        pass
-
-    transformers.AutoModel = AutoModel
-    transformers.AutoTokenizer = AutoTokenizer
+        transformers.AutoModel = AutoModel
+        transformers.AutoTokenizer = AutoTokenizer
     _ensure_module("numpy")
 
 
@@ -120,10 +124,11 @@ def _load_platform_module():
         pytest.fail(f"camel-oasis platform.py is missing at {platform_file}")
 
     _install_heavy_stubs()
-    oasis = _ensure_module("oasis")
-    oasis.__path__ = [str(oasis_dir)]
-    oasis.__package__ = "oasis"
-    oasis.__version__ = distribution.version
+    oasis, oasis_created = _ensure_module("oasis")
+    if oasis_created:
+        oasis.__path__ = [str(oasis_dir)]
+        oasis.__package__ = "oasis"
+        oasis.__version__ = distribution.version
 
     # Import the submodule directly so oasis/__init__.py does not pull camel,
     # igraph, or neo4j. The namespace entry above keeps that __init__ from running.

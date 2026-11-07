@@ -61,6 +61,9 @@ packages = ["app"]
 # camel-oasis 0.2.5 exact-pins transitive copies that GitHub Advisory marks
 # critical. unstructured>=0.24 needs psutil>=7.2.2, which is above camel-ai's
 # psutil<6 cap; camel-ai only uses the stable Process/cpu/memory APIs.
+# sentence-transformers 6 requires transformers>=5, which dropped BERT
+# relative_key. backend/scripts/twhin_bert_compat.py restores that attention
+# on the installed transformers 5 instead of downgrading it.
 # Overrides apply during uv resolution; they do not fork oasis.
 [tool.uv]
 override-dependencies = [
